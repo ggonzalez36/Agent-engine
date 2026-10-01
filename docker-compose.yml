@@ -1,0 +1,100 @@
+services:
+  # ============================================================================
+  # ALMACENAMIENTO & PERSISTENCIA TRANSACCIONAL
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: platform_user
+      POSTGRES_PASSWORD: platform_secure_password
+      POSTGRES_DB: platform_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/db/migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform_user -d platform_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # BROKER DE MENSAJERÍA Y CACHÉ
+  # ============================================================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: platform-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================================
+  # BACKEND TRANSACCIONAL (GO API)
+  # ============================================================================
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    container_name: platform-backend-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: "postgres://platform_user:platform_secure_password@postgres:5432/platform_db?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      SERVICE_AUTH_TOKEN: "${SERVICE_AUTH_TOKEN:-dev-internal-service-token-secret}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ============================================================================
+  # RELAY WORKER (PATRÓN OUTBOX - GO)
+  # ============================================================================
+  backend-relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.relay
+    container_name: platform-backend-relay
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgres://platform_user:platform_secure_password@postgres:5432/platform_db?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ============================================================================
+  # MOTOR MULTIAGENTE (PYTHON / LANGGRAPH)
+  # ZERO TRUST: Carece de DATABASE_URL o credenciales de PostgreSQL
+  # ============================================================================
+  agent-engine:
+    build:
+      context: ./agent-engine
+      dockerfile: Dockerfile
+    container_name: platform-agent-engine
+    restart: unless-stopped
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      BACKEND_API_URL: "http://backend-api:8080"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      SERVICE_AUTH_TOKEN: "${SERVICE_AUTH_TOKEN:-dev-internal-service-token-secret}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend-api:
+        condition: service_started
+
+volumes:
+  pgdata:

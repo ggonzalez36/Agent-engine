@@ -1,0 +1,28 @@
+# Binarios y compilados de Go
+backend/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+coverage.txt
+profile.out
+
+# Python & Entornos Virtuales
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Base de datos y secretos locales
+*.env
+*.env.local
+.DS_Store
+Thumbs.db

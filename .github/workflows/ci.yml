@@ -1,0 +1,138 @@
+name: CI / Security Pipeline (DevSecOps)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  security-events: write # Permite subir reportes SARIF a GitHub Security
+
+jobs:
+  # ============================================================================
+  # 1. CI BACKEND (GOLANG: LINTERS, VULNERABILIDADES & PRUEBAS DETERMINISTAS)
+  # ============================================================================
+  backend-ci:
+    name: Backend (Go Lint & Tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout del Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Go 1.24
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: backend/go.sum
+
+      - name: Ejecutar golangci-lint (con Gosec & Staticcheck)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61
+          working-directory: backend
+          args: --config=.golangci.yml
+
+      - name: Ejecutar Tests Unitarios con Race Detector (-race)
+        run: |
+          go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Validar Cobertura Mínima
+        run: |
+          go tool cover -func=coverage.txt
+
+  # ============================================================================
+  # 2. CI MOTOR AGÉNTICO (PYTHON / LANGGRAPH: RUFF & TEST ESTRUCTURAL)
+  # ============================================================================
+  agent-engine-ci:
+    name: Agent Engine (Ruff Lint & Graph Tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-engine
+    steps:
+      - name: Checkout del Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar Dependencias y Herramientas de Calidad
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest pytest-asyncio
+          pip install .
+
+      - name: Auditoría Estática con Ruff (Seguridad Bandit + PEP8)
+        run: |
+          ruff check . --config=ruff.toml
+
+      - name: Validación de Formato con Ruff
+        run: |
+          ruff format --check .
+
+      - name: Ejecutar Tests Estructurales y de Seguridad
+        run: |
+          pytest -v tests/
+
+  # ============================================================================
+  # 3. ESCANEO DE VULNERABILIDADES EN CONTENEDORES (TRIVY CONTAINER SCAN)
+  # ============================================================================
+  container-security-trivy:
+    name: Trivy Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: [ backend-ci, agent-engine-ci ]
+    strategy:
+      matrix:
+        include:
+          - name: backend-api
+            context: ./backend
+            dockerfile: ./backend/Dockerfile.api
+            image: platform/backend-api:scan
+          - name: backend-relay
+            context: ./backend
+            dockerfile: ./backend/Dockerfile.relay
+            image: platform/backend-relay:scan
+          - name: agent-engine
+            context: ./agent-engine
+            dockerfile: ./agent-engine/Dockerfile
+            image: platform/agent-engine:scan
+    steps:
+      - name: Checkout del Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir Imagen para Escaneo
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ matrix.image }}
+
+      - name: Escaneo de Vulnerabilidades con Aqua Security Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.name }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1' # Bloquea el pipeline ante vulnerabilidades CRITICAL o HIGH
+          ignore-unfixed: true
+
+      - name: Subir Resultados SARIF a GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.name }}.sarif'
+          category: trivy-${{ matrix.name }}

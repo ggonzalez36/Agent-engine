@@ -1,0 +1,46 @@
+# ==============================================================================
+# STAGE 1: Build Environment (Multi-Stage)
+# ==============================================================================
+FROM golang:1.24-alpine AS builder
+
+# Instalación de certificados SSL raíz y zona horaria
+RUN apk add --no-cache ca-certificates tzdata
+
+# Creación de usuario no privilegiado (UID 10001) para ejecución segura (Unprivileged)
+RUN adduser -D -g '' -u 10001 -h /home/appuser appuser
+
+WORKDIR /build
+
+# Caché óptimo de dependencias de Go
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copia de código fuente
+COPY . .
+
+# Compilación estática:
+# CGO_ENABLED=0: Sin dependencias de C runtime (Glibc/Musl)
+# -w -s: Remueve tablas de símbolos y depuración DWARF para minimizar tamaño y superficie de ataque
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-w -s" \
+    -o /app/api ./cmd/api
+
+# ==============================================================================
+# STAGE 2: Minimal Distroless / Scratch Runtime (Zero Shell, Zero Attack Surface)
+# ==============================================================================
+FROM scratch
+
+# Copia de certificados CA raíz para permitir llamadas seguras TLS (AWS, OpenAI, etc.)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/passwd /etc/passwd
+
+# Copia exclusiva del binario compilado
+COPY --from=builder /app/api /app/api
+
+# Ejecución forzada con usuario no privilegiado (UID 10001)
+USER 10001:10001
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/api"]

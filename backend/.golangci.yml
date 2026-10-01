@@ -1,0 +1,38 @@
+# Configuración estricta de golangci-lint (DevSecOps Baseline)
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters-settings:
+  govet:
+    check-shadowing: true
+    enable-all: true
+  gosec:
+    severity: medium
+    confidence: medium
+  revive:
+    min-confidence: 0.8
+  gocyclo:
+    min-complexity: 15
+  misspell:
+    locale: US
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck      # Detecta llamadas sin verificación de error
+    - govet         # Detecciones heurísticas del compilador oficial
+    - ineffassign   # Detecta asignaciones inefectivas
+    - staticcheck   # Análisis estático avanzado
+    - typecheck     # Validación de tipos estricta
+    - unused        # Código o variables huérfanas
+    - gosec         # Auditoría de seguridad contra vulnerabilidades conocidas (CWE)
+    - revive        # Reglas de estilo y calidad idiomática de Go
+    - gocyclo       # Medición de complejidad ciclomática
+    - bodyclose     # Evita fugas de descriptores de sockets HTTP sin cerrar
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
