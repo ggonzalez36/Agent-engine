@@ -6,7 +6,7 @@ High-performance backend service built with Go 1.24 utilizing the standard libra
 - **Transactional Outbox Pattern:** Atomic double-write (`sqlc.WithTx()`) persisting orders and outbox events in the same ACID transaction.
 - **Asynchronous Relay Worker:** High-performance polling with `SELECT ... FOR UPDATE SKIP LOCKED` backed by a partial index on `scheduled_at`.
 - **Server-Sent Events (SSE) Telemetry:** Streaming multiplexer with keep-alive heartbeat (`: ping\n\n`) and clean connection cleanup.
-- **Zero Trust Access Control:** Constant-time comparison (`subtle.ConstantTimeCompare`) Bearer token authentication middleware for Service-to-Service authorization.
+- **Service-to-Service Access Control:** Constant-time comparison (`subtle.ConstantTimeCompare`) Bearer token authentication middleware for Service-to-Service authorization.
 
 ## Build & Test
 ```bash

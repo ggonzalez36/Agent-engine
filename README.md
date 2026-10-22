@@ -1,12 +1,16 @@
-# Hybrid Transactional Platform & Distributed Multi-Agent Engine (EDA)
+# Transactional Outbox + Multi-Agent Engine (Go, PostgreSQL, LangGraph)
 
-[![CI / Security Pipeline](https://github.com/platform/hybrid-agent-platform/actions/workflows/ci.yml/badge.svg)](file:///.github/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](file:///backend/go.mod)
-[![Python Version](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python)](file:///agent-engine/pyproject.toml)
-[![Architecture ADR](https://img.shields.io/badge/ADR-0001%20Accepted-success)](file:///docs/adr/0001-hybrid-multiagent-outbox-architecture.md)
-[![Zero Trust](https://img.shields.io/badge/Security-Zero%20Trust%20ACL-red)](file:///backend/internal/middleware/auth.go)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](backend/go.mod)
+[![Python Version](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python)](agent-engine/pyproject.toml)
+[![Architecture ADR](https://img.shields.io/badge/ADR-0001%20Accepted-success)](docs/adr/0001-hybrid-multiagent-outbox-architecture.md)
+[![Service Auth](https://img.shields.io/badge/Security-Service%20Token%20ACL-red)](backend/internal/middleware/auth.go)
 
-Enterprise-grade, distributed Event-Driven Architecture (EDA) platform that decouples high-throughput, deterministic transactional workflows (Golang + PostgreSQL) from probabilistic, iterative multi-agent Artificial Intelligence workflows (Python + LangGraph). The system guarantees ACID consistency, At-Least-Once delivery, real-time granular telemetry via Server-Sent Events (SSE), and a Zero Trust security boundary.
+An event-driven prototype that separates a deterministic transactional core (**Go + PostgreSQL**) from an iterative multi-agent workflow (**Python + LangGraph**). Orders and their events are written in the same PostgreSQL transaction (transactional outbox); a relay publishes pending events to Redis Pub/Sub using `SELECT ... FOR UPDATE SKIP LOCKED`; a LangGraph supervisor routes each order through risk, compliance and finalization agents; and progress is streamed to clients over Server-Sent Events (SSE). Agents can only change data through the Go API, authenticated with a service token.
+
+> **Scope:** personal learning project with synthetic data; it is not used in production and the Terraform has not been applied to a real AWS account.
+> - **Implemented:** Go API (order creation, status update, SSE telemetry endpoint), sqlc repositories, atomic order + outbox write, relay worker with `SKIP LOCKED` and at-least-once publishing to Redis, constant-time service-token middleware, LangGraph supervisor (star topology) with `recursion_limit=15` and `astream_events` telemetry, Redis consumer with idempotency keys, regex prompt-injection sanitizer, LLM-as-a-judge evaluator, Go unit tests and Python tests, multi-stage non-root Dockerfiles, Docker Compose, a GitHub Actions workflow (lint, tests, Trivy), Terraform for VPC/EKS/RDS/ElastiCache/IRSA, and one ADR.
+> - **Simulated / simplified:** the risk and compliance agents return deterministic results; the supervisor uses an OpenAI model with structured output only when `OPENAI_API_KEY` is set and otherwise falls back to deterministic routing; the LLM judge also has a heuristic fallback.
+> - **Planned:** a frontend client, model-based risk scoring, and Secrets Manager rotation. The CI workflow is being stabilized (linter and Python packaging steps).
 
 ---
 
@@ -15,13 +19,13 @@ Enterprise-grade, distributed Event-Driven Architecture (EDA) platform that deco
 ```mermaid
 flowchart TD
     subgraph ClientLayer ["1. Client Layer"]
-        FE["Frontend (React / Angular)"]
+        FE["Client (curl / frontend planned)"]
     end
 
     subgraph GoBackend ["2. Transactional Backend (Go 1.24)"]
-        API["HTTP API (net/http + Zero Trust ACL)"]
-        TX["Atomic sqlc.WithTx()"]
-        RELAY["Outbox Relay Worker (Goroutine Pool)"]
+        API["HTTP API (net/http + service-token ACL)"]
+        TX["Atomic sqlc WithTx()"]
+        RELAY["Outbox Relay Worker (bounded goroutines)"]
         SSE["SSE Telemetry Multiplexer"]
     end
 
@@ -31,12 +35,12 @@ flowchart TD
     end
 
     subgraph AgentEngine ["4. Multi-Agent Engine (Python 3.11 / LangGraph)"]
-        SUB["Async Redis Consumer"]
+        SUB["Async Redis Consumer (idempotent)"]
         SUP["Supervisor (Star StateGraph)"]
         A1["Risk Evaluator Agent"]
         A2["Compliance Checker Agent"]
         A3["Order Finalizer Agent"]
-        CLI["Zero-Trust BackendClient (HTTP/mTLS)"]
+        CLI["BackendClient (HTTP + Bearer token)"]
     end
 
     %% Workflow Steps
@@ -47,12 +51,12 @@ flowchart TD
     RELAY -->|"4. Publish (At-Least-Once)"| REDIS
     REDIS -->|"5. Consume CloudEvent"| SUB
     SUB -->|"6. Trigger Workflow (recursion_limit=15)"| SUP
-    SUP --> A1
-    SUP --> A2
-    A1 & A2 --> A3
-    A3 -->|"7. Authorized status mutation (Zero Trust)"| CLI
+    SUP <--> A1
+    SUP <--> A2
+    SUP <--> A3
+    A3 -->|"7. Authorized status update"| CLI
     CLI -->|"Bearer Auth"| API
-    SUP & A1 & A2 & A3 -->|"8. astream_events Granular Telemetry"| REDIS
+    SUP & A1 & A2 & A3 -->|"8. astream_events Telemetry"| REDIS
     REDIS -->|"9. Sub: telemetry:{correlation_id}"| SSE
     SSE -->|"10. Server-Sent Events (Keep-Alive)"| FE
 ```
@@ -62,37 +66,37 @@ flowchart TD
 ## 🎯 The 5 Core Architectural Pillars
 
 ### 1. Persistence Decoupling & Transactional Outbox Pattern
-- **Elimination of Dual-Write Inconsistencies:** Business entity persistence in `orders` and event registration in `outbox_events` are executed within the **same ACID PostgreSQL transaction** via [`sqlc.WithTx()`](file:///backend/internal/service/order_service.go).
-- **Lock-Free Asynchronous Polling:** The [`RelayWorker`](file:///backend/internal/worker/relay_worker.go) fetches unprocessed records using `SELECT ... FOR UPDATE SKIP LOCKED` backed by the high-performance partial index `idx_outbox_events_pending_polling`, ensuring multiple horizontal worker replicas in AWS EKS never contend for the same event locks.
-- **Thread-Safe Concurrent At-Least-Once Delivery:** Concurrently publishes to Redis Pub/Sub using a buffered worker semaphore pool while applying status updates (`PUBLISHED`/`FAILED`) sequentially and atomically on the database transaction.
-- **Graceful Shutdown:** Context-driven lifecycle management adhering to `SIGTERM` and `SIGINT` kernel signals.
+- **Avoiding Dual-Write Inconsistencies:** The row in `orders` and the event in `outbox_events` are written in the **same PostgreSQL transaction** via [`WithTx()`](backend/internal/service/order_service.go).
+- **Non-Blocking Polling:** The [`RelayWorker`](backend/internal/worker/relay_worker.go) fetches pending records with `SELECT ... FOR UPDATE SKIP LOCKED`, backed by the partial index `idx_outbox_events_pending_polling`, so several relay replicas can run without picking the same event.
+- **At-Least-Once Delivery:** Publishes to Redis Pub/Sub concurrently through a bounded semaphore and records the outcome (`PUBLISHED`/`FAILED`) in the same database transaction. Consumers must be idempotent, which the Python consumer handles with Redis keys.
+- **Graceful Shutdown:** Context-driven shutdown on `SIGTERM` and `SIGINT`.
 
 ### 2. Multi-Agent Engine with Star Topology (LangGraph)
-- **Central Supervisor Orchestrator:** The [`SupervisorGraph`](file:///agent-engine/src/graph/supervisor.py) directs transitions toward specialist agents: [`risk_evaluator`](file:///agent-engine/src/graph/nodes.py), [`compliance_checker`](file:///agent-engine/src/graph/nodes.py), and [`order_finalizer`](file:///agent-engine/src/graph/nodes.py).
-- **Structured Output Routing:** Next-node transitions are strictly enforced through typed Pydantic models ([`RouterDecision`](file:///agent-engine/src/state/agent_state.py)), with a deterministic heuristic fallback for resilient offline/degraded operation.
-- **Immutable Append-Only State:** The global [`AgentState`](file:///agent-engine/src/state/agent_state.py) enforces non-destructive reducer operators (`add_messages`, `operator.add`) for immutable forensic auditability.
-- **Guaranteed Token Safeguard:** All graph invocations enforce an explicit `recursion_limit=15` preventing infinite execution cycles.
+- **Central Supervisor:** The [`SupervisorGraph`](agent-engine/src/graph/supervisor.py) routes to specialist agents defined in [`nodes.py`](agent-engine/src/graph/nodes.py): `risk_evaluator`, `compliance_checker` and `order_finalizer`; each returns control to the supervisor.
+- **Structured Output Routing:** The next node is chosen through a typed Pydantic model ([`RouterDecision`](agent-engine/src/state/agent_state.py)) when an LLM is configured, with a deterministic fallback for offline or degraded operation.
+- **Append-Only State:** The [`AgentState`](agent-engine/src/state/agent_state.py) uses reducer operators (`add_messages`, `operator.add`) so messages and the audit trail are appended rather than overwritten.
+- **Loop Safeguard:** Graph invocations set an explicit `recursion_limit=15` to stop runaway cycles.
 
 ### 3. Real-Time Telemetry Streaming (SSE + Redis)
-- **Reactive Streaming via `astream_events`:** The Python engine taps into LangGraph's lifecycle events (`on_chain_start`, `on_chat_model_stream`, `on_tool_start`) and pipes real-time updates to Redis Pub/Sub on `telemetry:{correlation_id}` channels.
-- **Go SSE Multiplexer:** The [`SSETelemetryHandler`](file:///backend/internal/handler/sse_handler.go) asynchronously multiplexes Redis streams into a persistent `text/event-stream` for frontend clients.
-- **Keep-Alive & Memory Leak Prevention:** Implements a 15-second heartbeat ticker emitting `: ping\n\n` comments to bypass reverse-proxy idle timeouts (AWS ALB / Cloudflare) and releases subscription handles on client disconnection via `defer pubsub.Close()`.
+- **Streaming via `astream_events`:** The Python engine forwards LangGraph lifecycle events and agent milestones to Redis Pub/Sub on `telemetry:{correlation_id}` channels.
+- **Go SSE Multiplexer:** The [`SSETelemetryHandler`](backend/internal/handler/sse_handler.go) relays the Redis channel to clients as a `text/event-stream`.
+- **Keep-Alive & Cleanup:** A 15-second heartbeat (`: ping\n\n`) keeps proxies from closing idle connections, and the subscription is closed when the client disconnects.
 
-### 4. Zero Trust Security & Storage Isolation
-- **Storage Isolation:** The Python runtime environment has zero database drivers (`psycopg2`, `asyncpg`, `sqlalchemy`) and zero connection strings (`DATABASE_URL`).
-- **Access Control Lists (ACL):** All business entity mutations requested by agents must traverse the Go HTTP API via [`BackendClient`](file:///agent-engine/src/clients/backend_client.py), protected by the [`ServiceAuthMiddleware`](file:///backend/internal/middleware/auth.go) using constant-time comparison (`subtle.ConstantTimeCompare`).
-- **Prompt Injection Defense:** Input text is sanitized through semantic and regex guardrails ([`sanitize_text`](file:///agent-engine/src/security/sanitizer.py)) before reaching the Supervisor.
-- **Secret Management:** Zero plaintext tokens in source code; dynamic injection through environment variables and AWS Secrets Manager integration via Terraform.
+### 4. Service Authentication & Storage Isolation
+- **Storage Isolation:** The Python runtime has no database drivers and no database connection string.
+- **Access Control:** Agents change business data only through the Go HTTP API via [`BackendClient`](agent-engine/src/clients/backend_client.py), protected by [`ServiceAuthMiddleware`](backend/internal/middleware/auth.go) with constant-time token comparison (`subtle.ConstantTimeCompare`). This is a shared service token; mTLS or workload identity would be the next step.
+- **Prompt Injection Defense:** Input text passes through regex-based guardrails ([`sanitize_text`](agent-engine/src/security/sanitizer.py)) before reaching the supervisor.
+- **Secret Management:** No tokens in source code; secrets come from environment variables locally, and the Terraform creates AWS Secrets Manager secrets with IRSA read access.
 
-### 5. DevSecOps & Production Reliability
-- **Unprivileged Multi-Stage Containers:** 
-  - Go compiles statically (`CGO_ENABLED=0`, `-ldflags="-w -s"`) into minimal `scratch` images running under `USER 10001:10001`.
-  - Python runs under an unprivileged user with `dumb-init` handling PID 1 signal forwarding and zombie process reaping.
-- **Testing Pyramid:**
-  - Unit tests with race detection (`go test -race`).
-  - Containerized transactional integration tests using [`Testcontainers`](file:///backend/internal/service/order_service_integration_test.go).
-  - Probabilistic agent evaluation (*LLM-as-a-Judge*) in [`tests/eval/test_llm_judge.py`](file:///agent-engine/tests/eval/test_llm_judge.py).
-  - Vulnerability scanning in CI/CD via Aqua Security Trivy.
+### 5. DevSecOps & Reliability
+- **Non-Root Multi-Stage Containers:**
+  - Go is built statically (`CGO_ENABLED=0`, `-ldflags="-w -s"`) into `scratch` images running as `USER 10001:10001`.
+  - Python runs as a non-root user with `dumb-init` as PID 1 for signal forwarding.
+- **Testing:**
+  - Go unit tests with the race detector (`go test -race`).
+  - An integration test using [Testcontainers](backend/internal/service/order_service_integration_test.go) (build tag `integration`).
+  - Agent evaluation with an *LLM-as-a-judge* in [`tests/eval/test_llm_judge.py`](agent-engine/tests/eval/test_llm_judge.py).
+  - Vulnerability scanning in CI with Trivy.
 
 ---
 
@@ -102,42 +106,42 @@ flowchart TD
 .
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                 # CI/CD Pipeline: Linters, -race Tests, Trivy Scan
+│       └── ci.yml                 # CI: linters, -race tests, Docker build, Trivy scan
 ├── agent-engine/                  # Multi-Agent Engine (Python / LangGraph)
-│   ├── Dockerfile                 # Multi-stage unprivileged with dumb-init
+│   ├── Dockerfile                 # Multi-stage, non-root, dumb-init
 │   ├── pyproject.toml             # Dependencies: langgraph, langchain, pydantic, redis
 │   ├── ruff.toml                  # Linter and Bandit security rules
 │   ├── src/
-│   │   ├── clients/               # Zero-Trust BackendClient (HTTP to Go)
+│   │   ├── clients/               # BackendClient (HTTP to Go)
 │   │   ├── consumer/              # Redis Pub/Sub consumer with idempotency
-│   │   ├── evaluation/            # LLM-as-a-Judge probabilistic evaluator
-│   │   ├── graph/                 # SupervisorGraph (Star topology) & Specialist Nodes
-│   │   ├── security/              # Prompt Injection sanitizer
-│   │   ├── state/                 # Immutable append-only AgentState
+│   │   ├── evaluation/            # LLM-as-a-judge evaluator
+│   │   ├── graph/                 # SupervisorGraph (star topology) & specialist nodes
+│   │   ├── security/              # Prompt injection sanitizer
+│   │   ├── state/                 # Append-only AgentState
 │   │   └── telemetry/             # Redis Pub/Sub telemetry publisher
 │   └── tests/                     # Security, graph topology & LLM judge tests
 ├── backend/                       # Transactional Backend (Go 1.24)
-│   ├── Dockerfile.api             # Distroless Scratch for HTTP API
-│   ├── Dockerfile.relay           # Distroless Scratch for Outbox Relay Worker
+│   ├── Dockerfile.api             # scratch image for the HTTP API
+│   ├── Dockerfile.relay           # scratch image for the Outbox Relay Worker
 │   ├── cmd/
 │   │   ├── api/                   # Server entrypoint (net/http + SSE)
-│   │   └── relay/                 # Outbox Relay Worker daemon entrypoint
+│   │   └── relay/                 # Outbox Relay Worker entrypoint
 │   ├── db/
 │   │   ├── migrations/            # SQL DDL migrations (pgcrypto, orders, outbox)
 │   │   └── queries/               # sqlc queries (orders & outbox with SKIP LOCKED)
 │   ├── internal/
-│   │   ├── domain/                # Canonical CloudEvents v1.0 envelope
+│   │   ├── domain/                # CloudEvents v1.0 envelope
 │   │   ├── handler/               # HTTP & SSE Telemetry handlers
-│   │   ├── middleware/            # Zero Trust ServiceAuthMiddleware
+│   │   ├── middleware/            # ServiceAuthMiddleware
 │   │   ├── repository/            # sqlc generated Go code
 │   │   ├── service/               # OrderService with atomic WithTx() persistence
-│   │   └── worker/                # Concurrent, thread-safe RelayWorker
+│   │   └── worker/                # Concurrent RelayWorker
 │   └── sqlc.yaml                  # sqlc configuration for pgx/v5
 ├── docs/
 │   └── adr/
 │       └── 0001-hybrid-multiagent-outbox-architecture.md  # Architecture Decision Record
 ├── infra/
-│   └── terraform/                 # IaC: AWS EKS, RDS PostgreSQL, ElastiCache Redis, IRSA
+│   └── terraform/                 # IaC: AWS VPC, EKS, RDS PostgreSQL, ElastiCache Redis, IRSA
 ├── docker-compose.yml             # Local development orchestration
 └── README.md                      # Platform documentation
 ```
@@ -152,21 +156,21 @@ flowchart TD
 - [Python 3.11+](https://www.python.org/)
 
 ### 1. Environment Configuration
-Create a `.env` file in the project root:
+Create a `.env` file in the project root (values below are placeholders):
 
 ```bash
-OPENAI_API_KEY=your-openai-api-key-here
-SERVICE_AUTH_TOKEN=supersecret-internal-service-token
+OPENAI_API_KEY=your-openai-api-key-here   # optional: without it, deterministic routing is used
+SERVICE_AUTH_TOKEN=change-me-local-service-token
 ```
 
 ### 2. Launching Services via Docker Compose
-The [`docker-compose.yml`](file:///docker-compose.yml) manifest provisions PostgreSQL 16 (with automatic schema migrations), Redis 7, the Go API, the Outbox Relay Worker, and the Python LangGraph Agent Engine:
+The [`docker-compose.yml`](docker-compose.yml) file starts PostgreSQL 16 (with schema migrations), Redis 7, the Go API, the Outbox Relay Worker and the Python LangGraph agent engine:
 
 ```bash
 docker compose up --build
 ```
 
-Default endpoints upon startup:
+Endpoints after startup:
 - **API Health Check:** `GET http://localhost:8080/healthz`
 - **Create Order (Transactional):** `POST http://localhost:8080/api/v1/orders`
 - **Telemetry Stream (SSE):** `GET http://localhost:8080/v1/telemetry/stream?correlation_id=<ID>`
@@ -204,8 +208,8 @@ Default endpoints upon startup:
 }
 ```
 
-### 2. Canonical CloudEvents v1.0 Envelope on Redis
-The event atomically recorded in `outbox_events` and published to `orders.events`:
+### 2. CloudEvents v1.0 Envelope on Redis
+The event recorded in `outbox_events` (in the same transaction as the order) and published to `orders.events`:
 
 ```json
 {
@@ -228,7 +232,7 @@ The event atomically recorded in `outbox_events` and published to `orders.events
 ```
 
 ### 3. Real-Time SSE Telemetry Stream
-**Frontend Connection:** `GET /v1/telemetry/stream?correlation_id=corr_9876543210`
+**Client Connection:** `GET /v1/telemetry/stream?correlation_id=corr_9876543210`
 
 ```text
 event: connected
@@ -260,7 +264,7 @@ go test -v -race ./...
 ```
 
 ### Transactional Integration Tests with Testcontainers
-Validates end-to-end atomic Outbox persistence against an ephemeral PostgreSQL container:
+Checks the atomic order + outbox write against an ephemeral PostgreSQL container (requires Docker; the Testcontainers module may need to be added with `go get` first):
 ```bash
 cd backend
 go test -v -tags=integration ./...
@@ -269,14 +273,14 @@ go test -v -tags=integration ./...
 ### Multi-Agent Engine Tests & Linters (Python)
 ```bash
 cd agent-engine
-# Static audit, formatting and security checks
+# Lint, formatting and security rules
 ruff check .
 ruff format --check .
 
 # Structural and prompt injection tests
 pytest -v tests/unit/
 
-# Probabilistic evaluation (LLM-as-a-Judge)
+# LLM-as-a-judge evaluation (uses the heuristic fallback without OPENAI_API_KEY)
 pytest -v tests/eval/
 ```
 
@@ -284,15 +288,15 @@ pytest -v tests/eval/
 
 ## 🔒 Cloud Infrastructure (AWS / Terraform)
 
-The [`infra/terraform`](file:///infra/terraform) directory contains the infrastructure-as-code manifests:
-- **Networking:** Multi-AZ VPC with dedicated public, private, and isolated database subnets ([`vpc.tf`](file:///infra/terraform/vpc.tf)).
-- **Compute:** AWS EKS cluster with IAM Roles for Service Accounts ([`irsa.tf`](file:///infra/terraform/irsa.tf)).
-- **Persistence:** Multi-AZ AWS RDS PostgreSQL with KMS encryption and automated Secrets Manager credential rotation ([`rds.tf`](file:///infra/terraform/rds.tf)).
-- **Broker & Cache:** Multi-AZ AWS ElastiCache Redis with in-transit TLS encryption ([`elasticache.tf`](file:///infra/terraform/elasticache.tf)).
+The [`infra/terraform`](infra/terraform) directory contains the infrastructure-as-code (written for learning; not applied to a live account):
+- **Networking:** VPC with public, private compute and isolated database subnets ([`vpc.tf`](infra/terraform/vpc.tf)).
+- **Compute:** AWS EKS cluster and node group ([`eks.tf`](infra/terraform/eks.tf)) with IAM Roles for Service Accounts ([`irsa.tf`](infra/terraform/irsa.tf)).
+- **Persistence:** AWS RDS PostgreSQL with storage encryption, Multi-AZ in the `prod` environment, and generated credentials stored in Secrets Manager ([`rds.tf`](infra/terraform/rds.tf)).
+- **Broker & Cache:** Multi-AZ AWS ElastiCache Redis with in-transit TLS and an auth token in Secrets Manager ([`elasticache.tf`](infra/terraform/elasticache.tf)).
 
 ---
 
 ## 📖 Key Documentation References
-- [ADR-0001: Hybrid Transactional & Multi-Agent Architecture](file:///docs/adr/0001-hybrid-multiagent-outbox-architecture.md)
-- [PostgreSQL DDL Migrations](file:///backend/db/migrations/000001_init_schema.up.sql)
-- [GitHub Actions CI/CD Pipeline](file:///.github/workflows/ci.yml)
+- [ADR-0001: Hybrid Transactional & Multi-Agent Architecture](docs/adr/0001-hybrid-multiagent-outbox-architecture.md)
+- [PostgreSQL DDL Migrations](backend/db/migrations/000001_init_schema.up.sql)
+- [GitHub Actions CI/CD Pipeline](.github/workflows/ci.yml)

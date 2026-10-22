@@ -6,7 +6,7 @@ Asynchronous multi-agent system organized in a star topology (*Supervisor Patter
 - **Asynchronous Consumption:** Subscribes to the Outbox events topic on Redis with `event_id` deduplication (Idempotence).
 - **Star Topology Orchestration:** Central `Supervisor` node enforcing Pydantic `Structured Output` routing with deterministic fallback.
 - **Append-Only Immutability:** Global `AgentState` utilizes non-destructive reducer operators (`operator.add`, `add_messages`).
-- **Zero Trust Isolation:** Completely isolated from PostgreSQL; entity mutations are strictly performed via `BackendClient` targeting the Go API with Bearer token authentication.
+- **Storage Isolation:** No direct PostgreSQL access; entity mutations are strictly performed via `BackendClient` targeting the Go API with Bearer token authentication.
 - **Real-Time Telemetry:** Streams granular `astream_events` to Redis `telemetry:{correlation_id}` channels for frontend Server-Sent Events (SSE).
 - **Defense-in-Depth:** Semantic and heuristic prompt injection sanitization, complemented by *LLM-as-a-Judge* probabilistic evaluations.
 
